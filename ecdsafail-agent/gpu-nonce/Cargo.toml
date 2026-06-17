@@ -1,0 +1,17 @@
+[package]
+name = "gpu-nonce"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gpu-nonce"
+path = "src/main.rs"
+
+[dependencies]
+cudarc = { version = "0.19.7", default-features = false, features = ["cuda-12080", "driver", "nvrtc", "dynamic-loading"] }
+quantum_ecc = { path = "../.." }
+alloy-primitives = "1.5"
+sha3 = "0.10"
+
+[profile.release]
+opt-level = 3

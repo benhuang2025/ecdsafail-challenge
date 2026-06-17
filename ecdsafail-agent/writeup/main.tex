@@ -1,0 +1,761 @@
+\documentclass[11pt]{ctexart}
+
+% ---------------------------------------------------------------------------
+% ecdsafail-agent：对本挑战、nonce 搜索、其瓶颈，以及本仓库（含从两个同行
+% 仓库借鉴的思路）如何攻克这些瓶颈的系统性中文报告。
+% 编译： make   （内部使用 xelatex + ctex/xeCJK）
+% ---------------------------------------------------------------------------
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{pifont}
+\usepackage{float}
+% 让较高的浮动图（流程图近满页）能落在靠近引用处的页顶，而非被推到文末。
+\renewcommand{\topfraction}{0.92}
+\renewcommand{\textfraction}{0.06}
+\renewcommand{\floatpagefraction}{0.82}
+\setcounter{topnumber}{1}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,calc}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+  showstringspaces=false,
+}
+% 行内等宽缩写： \c{DIALOG_GCD_COMPARE_BITS}
+\let\c\lstinline
+
+\title{\textbf{ECDSA-Fail 可逆点加挑战：\\
+背景、nonce 搜索、其瓶颈，\\ 以及 \texttt{ecdsafail-agent} 如何攻克它们}}
+\author{Brevis --- \texttt{ben@brevis.network}（与 Claude 协作）}
+\date{2026-06-17 \quad（前沿 \texttt{1caf521}，$q=1168$）}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本报告系统性地记录了在本仓库中开展的 \href{https://ecdsa.fail}{ecdsa.fail} 优化挑战。内容涵盖：
+（1）挑战背景；（2）为什么它很难；（3）为什么\emph{每一次}电路改进都会强制触发一次全新的
+\emph{nonce 搜索}；（4）nonce 搜索流水线及其瓶颈；（5）\texttt{ecdsafail-agent} 中的工具链如何
+攻克这些瓶颈——含保证 GPU 工具与官方电路严格对齐的\emph{对齐门}；（6）从两个同行仓库（\texttt{ecdsafail\_skills} 与 \texttt{ecdsafail\_gpu\_toolkit}）借鉴
+了哪些思路、各自解决了什么问题。所有数字均在当前本地前沿 \texttt{1caf521}（$q=1168$）、于
+8$\times$RTX-5090 主机 \texttt{zan3} 上实测得到。
+\end{abstract}
+
+\tableofcontents
+
+% =====================================================================
+\section{挑战背景}
+% =====================================================================
+
+挑战目标是一个\textbf{可逆（量子）电路，它把一个量子态的椭圆曲线点与一个经典椭圆曲线点在
+secp256k1 上相加}。该电路是 Shor 式攻击 ECDSA 的内层原语；竞赛要求参赛者最小化它的资源开销。电路在
+内部计算的是仿射点加 $R = P + Q$（$P$ 为目标寄存器里的量子点，$Q$ 为偏移比特里的经典点），其代数
+步骤见图~\ref{fig:compute}；而把代码跑成一个可计分提交的官方评测流程（含认证器 validator）见
+图~\ref{fig:harness}。
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}[
+  node distance=3.4mm,
+  cbox/.style={rectangle,draw,rounded corners,align=center,inner sep=3pt,font=\footnotesize,text width=118mm},
+  io/.style={rectangle,draw,align=center,inner sep=3pt,font=\footnotesize,fill=codebg,text width=118mm},
+  hot/.style={rectangle,draw,thick,rounded corners,align=center,inner sep=3pt,font=\footnotesize,text width=118mm,fill=codebg},
+  >={Stealth[]},
+]
+\node[io] (in) {\textbf{输入}\quad 目标寄存器 $=$ 量子点 $P=(P_x,P_y)$；\quad 偏移比特 $=$ 经典点 $Q=(Q_x,Q_y)$};
+\node[cbox,below=of in] (s1) {\ding{182}\ 相减：$P_x\mathrel{-}=Q_x,\ \ P_y\mathrel{-}=Q_y$\ \ $\Rightarrow$\ \ 寄存器现持有 $(dx,\,dy)$};
+\node[hot,below=of s1] (s2) {\ding{183}\ \textbf{模逆}：$dx \to dx^{-1}$（二进制-GCD / Kaliski 求逆 —— \emph{全电路最贵、Toffoli 与 qubit 的主战场}）};
+\node[cbox,below=of s2] (s3) {\ding{184}\ 斜率：$\lambda = dy\cdot dx^{-1} \pmod p$};
+\node[cbox,below=of s3] (s4) {\ding{185}\ 新 $x$ 坐标：$R_x = \lambda^2 - P_x - Q_x$（一次平方 $+$ Solinas 模约简）};
+\node[cbox,below=of s4] (s5) {\ding{186}\ 新 $y$ 坐标：$R_y = \lambda(Q_x - R_x) - Q_y$};
+\node[hot,below=of s5] (s6) {\ding{187}\ \textbf{反计算（uncompute）}：用第二次 Kaliski 求逆把 $\lambda$ 及所有 scratch 擦回 $0$ —— \emph{这一步保证电路可逆}};
+\node[io,below=of s6] (out) {\textbf{输出}\quad 目标寄存器 $=$ $R = P + Q$；\quad 所有 scratch $=0$};
+\draw[->](in)--(s1); \draw[->](s1)--(s2); \draw[->](s2)--(s3); \draw[->](s3)--(s4);
+\draw[->](s4)--(s5); \draw[->](s5)--(s6); \draw[->](s6)--(out);
+\end{tikzpicture}
+\caption{电路\emph{计算}的代数步骤（Roetteler 式双-Kaliski 点加，见 \c{src/point_add/mod.rs} 的算法
+注释）。注意两处加粗块：\ding{183} 模逆是开销主战场；\ding{187} 反计算把所有中间量擦回 $0$——这正是
+``可逆''的要求，也是后文 \texttt{anc} 通道所校验的（见 §\ref{sec:channels}）。}
+\label{fig:compute}
+\end{figure}
+
+\paragraph{评分。}目标是如下乘积：
+\[
+  \textbf{score} \;=\; (\text{平均执行的 Toffoli 数}) \;\times\; (\text{峰值 qubit 数}),
+  \qquad \text{越小越好。}
+\]
+\begin{itemize}[nosep]
+  \item \textbf{峰值 qubit} 是整条电路在任意时刻同时存活的 qubit 数的最大值——一个
+  \emph{随时间取的 max}，由那一个最宽的瞬间（即\emph{绑定者 binder}）决定。
+  \item \textbf{平均执行 Toffoli} 是在 $9024$ 个测试 shot 上、\emph{真正触发}的 Toffoli（CCX）
+  门数的均值（受数据/测量条件控制的门，按其触发比例计入，而非按静态存在与否）。
+\end{itemize}
+
+\paragraph{校验。}一次提交只有在所有 $9024$ 个测试输入上\textbf{完美可逆}时才会被计分：
+\texttt{0 经典失配 / 0 phase-garbage / 0 ancilla-garbage}（记作 ``$0/0/0$''）。测试输入由对电路
+op-stream 做 \textbf{SHAKE256} 挤压（squeeze）确定性地导出（一个 Fiat--Shamir 构造）：每个 shot
+$s$ 抽出两个标量 $k_1,k_2$，形成 $t=k_1 G$ 和 $o=k_2 G$，期望输出是仿射和 $e = t \oplus o$。
+
+\paragraph{当前状态。}公开最优为 \textbf{1{,}672{,}963{,}776}（commit \texttt{1caf521}，
+$q=1168$）。qubit 前沿在活跃期内一路下降：
+$1211 \to 1203 \to 1193 \to 1192 \to 1185 \to 1170 \to 1168$；\texttt{1caf521} 处的电路
+$\approx 10.26$M 个 op。官方评测工具是两个二进制（流程见图~\ref{fig:harness}）：\c{build_circuit}
+（从参赛者的 \c{build()} 生成 \texttt{ops.bin}），以及 \c{eval_circuit}（受信任的认证器：重新读取
+\texttt{ops.bin}，模拟全部 $9024$ 个 shot，强制 $0/0/0$，写出 \texttt{score.json}）。
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}[
+  node distance=4mm,
+  proc/.style={rectangle,draw,rounded corners,align=center,inner sep=4pt,font=\footnotesize,text width=120mm},
+  trust/.style={rectangle,draw,thick,rounded corners,align=left,inner sep=5pt,font=\footnotesize,text width=120mm,fill=codebg},
+  file/.style={cylinder,shape border rotate=90,aspect=0.18,draw,align=center,inner sep=3pt,font=\footnotesize,text width=58mm},
+  >={Stealth[]},
+]
+\node[proc] (build) {\textbf{参赛者可编辑代码}：\c{build()}（\c{src/point_add/mod.rs}）—— 发出门序列};
+\node[proc,below=of build] (bc) {\c{build_circuit}（\textbf{不可信}进程）：调用 \c{build()}，把门序列写到磁盘；\emph{本进程不仿真、不计分}};
+\node[file,below=of bc] (ops) {\texttt{ops.bin}\\（op-stream，$\approx$10.3M 个 op，落盘）};
+\node[trust,below=of ops] (eval) {\c{eval_circuit}（\textbf{可信认证器}进程，\emph{故意不 import 参赛者代码}）：\\[1pt]
+ \quad\ding{172}\ 从磁盘重读 \texttt{ops.bin}（当作完全不可信输入，先做边界检查）\\
+ \quad\ding{173}\ $\text{SHAKE256}(\text{op-stream})$ $\to$ Fiat--Shamir 派生 $9024$ 个测试 shot\\
+ \qquad\quad（每 shot：$k_1,k_2 \to t=k_1G,\ o=k_2G$，期望 $e=t\oplus o$）\\
+ \quad\ding{174}\ 逐 shot 模拟该电路，并与 secp256k1 参考加法器比对\\
+ \quad\ding{175}\ 四项校验 $\Rightarrow$ 必须 \textbf{$0/0/0$}（经典 \texttt{cls} / 相位 \texttt{pha} / 辅助 \texttt{anc}，外加可逆性）\\
+ \quad\ding{176}\ 计数门与 qubit $\Rightarrow$ \textbf{score} $=$ 平均执行 Toffoli $\times$ 峰值 qubit};
+\node[file,below=of eval] (out) {\texttt{score.json} $+$ \texttt{results.tsv}};
+\draw[->](build)--(bc); \draw[->](bc)--(ops); \draw[->](ops)--(eval); \draw[->](eval)--(out);
+\end{tikzpicture}
+\caption{官方评测（\emph{代码}）流程与\textbf{信任边界}。参赛者代码只在不可信的 \c{build_circuit} 里
+运行；受信任的 \c{eval_circuit} 在\emph{另一个进程}里从磁盘重读 \texttt{ops.bin}、且从不 import
+参赛者代码——因此参赛者代码无法影响计分。校验器（validator）就是 \c{eval_circuit} 的 \ding{175}：
+它把测试岛由 op-stream 经 SHAKE256 确定性导出，故\emph{任何对 op-stream 的改动都会重洗测试岛}
+（这正是后文需要重新 hunt nonce 的根源，见 §3）。}
+\label{fig:harness}
+\end{figure}
+
+% =====================================================================
+\section{这个挑战的难点}
+% =====================================================================
+
+\paragraph{两个互相耦合因子的乘积。}因为 score 是 $\text{Toffoli}\times\text{qubits}$，这两个
+因子互相博弈、必须协同优化。释放一个 qubit 通常要付出 Toffoli 代价（uncompute/recompute），而
+削减 Toffoli 有时又要付出一个 qubit（例如一个 vent 多占一个 ancilla）。决策准则是一个
+\emph{兑换率}：在当前前沿，一个峰值 qubit 价值 $\approx 1.1$--$1.4$M 分（经验上 $\approx$ 十几次
+Toffoli 打磨型提交），所以一个 qubit 几乎总是胜过一个 Toffoli 小缺口——但前提是你能\emph{值精确
+地（value-exactly）}把它释放掉。
+
+\paragraph{峰值是一个移动的、多相位的平台。}在成熟电路上，峰值不是一座孤立的高塔，而是一个
+\emph{平台}：若干互相独立的相位并列在同一高度。在 \texttt{1caf521}，绑定者是
+\c{dialog_gcd_apply_chunk_sub_ripple}；其附近的峰值被 apply fold 与第 84 轮的 Solinas square
+\emph{双重钉住（dual-pinned）}。要把这个数压下去，就必须对每一个共同绑定者做\emph{协调一致的}
+修改——只削掉一个，其它的仍卡在峰值。每次修改后绑定者都会迁移，所以这是一场打地鼠。
+
+\paragraph{两种正确性机制。}宽度削减是\emph{二值失败}的：要么值精确（在每个输入上都对），要么
+几乎破坏所有输入——没有渐进的``接近正确''阶梯，所以必须先证明其正确、再 $0/0/0$ 校验，然后才能
+搜索。而 Toffoli 截断是\emph{分级失败}的：它只在那些在\emph{可达验证支撑集}上可证为零的比特上才
+精确，并在别处引入一小撮、可刻画的\emph{硬输入（hard inputs）}。
+
+\paragraph{前沿很深，许多轴已被耗尽。}在调校过的基线上，便宜的旋钮已经走平（开销变为分配受限，
+迫使做结构性代码改动），而几个看似诱人的结构性想法在这里已被证明是死路：
+\begin{itemize}[nosep]
+  \item \textbf{jumpdivsteps}（Bernstein--Yang 矩阵批处理）：一次 jump-$T$ 矩阵-apply 需要四次
+  \emph{量子} small$\times$256 乘法，约为它所替代的便宜 33-bit \emph{经典常量}ripple 的
+  $\approx 2.6\times$，且会加宽 GCD 柱。NO-GO。
+  \item \textbf{批量对偶求逆}（主多项式 $M=d_1^2 d_2$）：$+1.26$--$1.3$M CCX，因为融合路径里没有
+  可摊销的独立乘法。
+  \item \textbf{通用 ZX/T-par peephole}：在这条手工调校过的电路上实测 $0$ 次抵消。
+  \item \textbf{仅靠旋钮压子峰}：堆叠进位截断会撞上一个不可约的 \texttt{cls=2} 结构地板；真正的
+  进展需要一次电路代码层面的改动。
+\end{itemize}
+
+% =====================================================================
+\section{为什么需要一次 nonce 搜索（``hunt''）}
+% =====================================================================
+
+测试输入是 op-stream 的确定性函数（SHAKE256 Fiat--Shamir）。所以\textbf{任何对 op-stream 的改动
+都会把全部 $9024$ 个 shot 重新洗牌}。一个在\emph{旧} shot 的可达支撑集上精确的截断，几乎绝不会在
+\emph{新} shot 上仍精确——它会获得硬输入，校验随即失败。
+
+逃生口是一个免费的 \textbf{nonce}：电路在尾部追加一个固定的 \textbf{96-op 恒等尾巴}（$48$ 对
+\c{X;X}，由 \c{DIALOG_TAIL_NONCE} 控制，\c{NONCE_BITS}$=48$；见 \c{src/point_add/mod.rs} 约
+L1773）。这条尾巴对量子态是恒等的——它\emph{不改变}所计算的函数，也\emph{不改变}门计数——但它扰动
+了 op-stream 的字节，从而扰动 SHAKE256 哈希，从而扰动那 $9024$ 个 shot。于是：
+\begin{quote}\itshape
+``尝试一个 nonce $N$'' = 为 hash$(\text{ops}\,\|\,N)$ 重新导出 Fiat--Shamir 测试岛
+（island），并检查（未改变的）电路是否恰好在\emph{那个特定}岛上是 $0/0/0$。
+\end{quote}
+因此，一次降分改动由两部分组成：（a）降低 $\text{Toffoli}\times\text{qubits}$ 的 op-stream 编辑；
+（b）一个\textbf{干净 nonce}，其重洗后的岛恰好躲开该编辑引入的每一个硬输入。第（b）部分就是
+\emph{nonce 搜索}。
+
+\paragraph{什么是``硬输入''（hard input）。}降分的手段（Toffoli 截断、把比较器变窄如
+\c{COMPARE_BITS} $46{\to}45$、进位截断等）本质上都是在\textbf{赌某个高位 / 进位 / 余项是 $0$}：
+完整电路对\emph{所有}输入都精确，而截断电路只在``被丢掉的那几位在该输入上确实为 $0$''时才精确。对
+\emph{绝大多数}输入这个赌注成立、结果照样对；但对\emph{极少数}输入那几位并非 $0$——截断丢掉了本该
+保留的信息，结果出错。\textbf{这些让赌注落空的输入，就是硬输入}：它们是用``在一小撮罕见输入上算错''
+换``更少的门 / 更少的 qubit''的代价。具体到本电路，每个 shot 的 $t,o$ 以及模逆量 $dx=P_x{-}Q_x$、
+$c=Q_x{-}R_x$ 的\emph{比特模式}决定了二进制-GCD 行走的步数 / 进位 / 比较结果；某个 shot 若踩中截断
+所赌的``应为 $0$ 却不为 $0$''情形，就成为一个硬输入，并按踩中的环节点亮对应通道（GCD/算术
+$\Rightarrow$ \texttt{cls}；测量-uncompute 留相位 $\Rightarrow$ \texttt{pha}；scratch 没擦净
+$\Rightarrow$ \texttt{anc}，三通道含义见 §\ref{sec:channels}）。
+
+\paragraph{硬输入密度与``悬崖''。}一次给定的截断，在所有可能输入里有一个\emph{固定的硬输入密度}。
+设每个岛（$9024$ 个输入）期望踩中的硬输入数为 $\lambda$，则按 Poisson 近似一个 nonce 干净的概率
+\[
+  P(\text{clean}) \;\approx\; e^{-\lambda},
+\]
+所以\textbf{$\lambda$ 稍涨一点，干净 nonce 就指数级变稀有}——这就是``截断悬崖''（\c{WIDTH_SLOPE}
+方向上每加一档密度 $\sim 25\times$）。截断越激进 $\Rightarrow$ 硬输入越多 $\Rightarrow$ $\lambda$
+越大 $\Rightarrow$ hunt 时间爆炸。这正是要挑\textbf{亚悬崖 / 值精确}候选的原因：新增硬输入尽量少、
+$\lambda$ 才低、hunt 才短（搜索就是去找一个 $9024$ 输入里\emph{一个硬输入都没踩中}的岛）。
+
+\subsection{三个校验通道：\texttt{cls} / \texttt{pha} / \texttt{anc}}
+\label{sec:channels}
+``$0/0/0$'' 里的三个数，正是官方认证器 \c{eval_circuit} 在每个 shot 上独立统计的三种失败计数
+（见 \c{src/bin/eval_circuit.rs} 约 L275--L331）。理解它们，要先记住：这是一条\textbf{可逆}电路，
+理想情况下它必须是计算基态上的一个\emph{纯置换}——把输入态 $\lvert t,o,\text{scratch}{=}0\rangle$
+干净地映成 $\lvert e,\dots,\text{scratch}{=}0\rangle$，不带任何残留。三个通道恰好检查这个``纯置换''
+的三个必要条件：
+
+\begin{description}[leftmargin=2.2em,style=nextline]
+  \item[\texttt{cls}（classical mismatch，经典失配）] 跑完电路后，读出两个\emph{输出寄存器}
+  $(g_x,g_y)$ 与期望的 $(e_x,e_y)=t\oplus o$ 比较；只要有一个比特不等就记一次失配。直白说：
+  \textbf{算出来的点加结果错了}。在本电路里这通常源自二进制-GCD 模逆（``dialog-GCD'' 行走）或
+  下游算术在某个``硬输入''上被截断截过了头。\emph{逐 shot 计数。}
+  \item[\texttt{pha}（phase-garbage，相位垃圾）] 认证器跟踪一个逐 shot 的相位寄存器
+  \c{sim.phase}；批次跑完后它必须为 $0$，否则记一次相位垃圾。含义：即便输出比特全对，电路也可能
+  给基态附加了一个\emph{相对相位} $\lvert\psi\rangle\to e^{i\theta}\lvert\psi\rangle$——那它就不是
+  我们要的那个置换酉算子了。在 Shor 攻击里点加要作用在\emph{叠加态}上，残留相位会破坏干涉，所以
+  必须为 $0$。相位主要由\textbf{基于测量的 uncompute}（\c{Hmr}/\c{R} 门）的随机测量结果决定。
+  \emph{逐 batch 计数。}
+  \item[\texttt{anc}（ancilla-garbage，辅助比特垃圾）] 把输出寄存器清零后，\emph{所有其余非寄存器
+  qubit}（即计算过程中临时借用的 scratch / 辅助比特）必须在每个存活 shot 上都回到
+  $\lvert 0\rangle$；只要有一个非零就记一次。含义：\textbf{借来的草稿纸没擦干净}。一次正确的可逆
+  计算必须把所有中间量\emph{反计算（uncompute）}回 $0$，否则这些脏比特仍与输出纠缠，电路就不是
+  一个干净置换（也无法把这些 qubit 安全回收复用）。\emph{逐 batch 计数。}
+\end{description}
+
+\paragraph{``三个都要等于 $0$ 才通过''是什么意思。}一次提交只有当这三个计数在全部 $9024$ 个 shot
+上\emph{同时}为零（即 $0/0/0$）时才被判为合法、才会计分。nonce 搜索做的事就是：电路本身固定不动，
+只换 nonce（从而换一组 $9024$ 个测试输入），去找一个让这三个计数恰好全归零的岛。一个优化截断会在某
+些输入上``踩雷''——这些就是\emph{硬输入}：踩中 GCD/算术的雷 $\Rightarrow$ \texttt{cls}$>0$；测量
+uncompute 留下相位 $\Rightarrow$ \texttt{pha}$>0$；scratch 没擦净 $\Rightarrow$ \texttt{anc}$>0$。
+搜索的目标，就是一个其岛恰好\emph{绕开所有三种雷}的 nonce。
+
+\paragraph{为什么 hunt 里主要盯 \texttt{cls} 与 \texttt{pha}（``dual-clean''）。}\texttt{anc} 在
+本电路里几乎从不\emph{独立}失败：辅助比特的反计算与点加结果由同一段算术驱动，所以 scratch 没擦净时
+输出几乎总是同时也错（\texttt{cls} 一起亮）——\texttt{anc} 基本是 \texttt{cls} 的``伴随''而非独立
+的绑定通道。真正互相独立、必须分别归零的是\textbf{经典}与\textbf{相位}两条轴：经典看算术对不对，相位
+看测量-uncompute 的随机结果干不干净，二者由不同的机制决定（后文 \S 5.4 的 leak 诊断会量化这种
+独立性）。因此 GPU hunt 把对每个 nonce 同时干净于这两条轴的称为 \textbf{双重干净（dual-clean）}，
+并把唯一的 dual-clean 赢家交给 CPU \c{eval_circuit} 复核\emph{完整的} $0/0/0$（含 \texttt{anc}）
+后才提交。
+
+% =====================================================================
+\section{Nonce 搜索流水线与其瓶颈}
+% =====================================================================
+
+\subsection{流水线}
+对每个候选 nonce $N$，流程如图~\ref{fig:flow} 所示，文字描述如下：
+\begin{enumerate}[nosep]
+  \item 导出岛：$\text{SHAKE256}(\text{op-stream}\,\|\,N)$；
+  \item 对每个 shot $s\in[0,9024)$：挤压出 $k_1,k_2$，计算 $t=k_1G$、$o=k_2G$（EC 标量乘），跳过
+  退化情形后压实，形成期望 $e=t\oplus o$；
+  \item \textbf{校验}电路在该岛上的表现：经典轴（GCD 求逆是否正确？）与相位轴（全局相位是否为
+  $0$？）；
+  \item 一个双重干净的 nonce $\to$ 交给 CPU \c{eval_circuit} 重新认证一次 $0/0/0$ $\to$ 若
+  score $<$ 前沿则 bake 并提交。
+\end{enumerate}
+
+\begin{figure}[tp]\centering
+\begin{tikzpicture}[
+  node distance=4mm and 12mm,
+  box/.style={rectangle,draw,rounded corners,align=center,inner sep=3pt,font=\footnotesize,text width=64mm},
+  dec/.style={diamond,draw,aspect=2.4,align=center,inner sep=0pt,font=\footnotesize,text width=28mm},
+  term/.style={rectangle,draw,align=center,inner sep=2pt,font=\footnotesize,fill=codebg},
+  >={Stealth[]},
+]
+\node[box] (A) {选 nonce $N$（48-bit）};
+\node[box,below=of A] (B) {Fiat--Shamir 导出岛\\$\text{SHAKE256}(\text{op-stream}\,\|\,N)$};
+\node[box,below=of B] (C) {每 shot $s\in[0,9024)$：$k_1,k_2=\text{squeeze}$；\\$t=k_1G$, $o=k_2G$（EC）；$e=t\oplus o$};
+\node[box,below=of C,fill=codebg] (S1) {\textbf{Stage-1：GPU 经典预过滤}\\\c{gcd.cu}（解析 GCD replay，不跑 op-loop）\\$\approx$8.6k--23.5k nonce/s};
+\node[dec,below=of S1] (D) {GCD-clean？\\（解析预过滤）};
+\node[box,below=of D,fill=codebg] (S2) {\textbf{Stage-2：GPU 精确 op-loop}\\\c{verify_dual}（跑满 10.3M-op，逐 batch 早退）\\$\approx$169 nonce/s（8 卡 $\approx$1{,}355）};
+\node[dec,below=of S2] (E) {精确 cls 且\\相位全 $0$？};
+\node[box,below=of E] (F) {DUAL-CLEAN 候选};
+\node[box,below=of F] (G) {CPU \c{eval_circuit} 复核\\$0/0/0$ 且 score $<$ 前沿？};
+\node[box,below=of G] (H) {bake nonce $\to$ commit $\to$ submit};
+
+\node[term,right=18mm of D] (X1) {REJECT（GCD-hard，$\approx 99.9\%$）};
+\node[term,right=18mm of E] (X2) {REJECT（精确经典 false-clean $\approx 80\%$ / 相位失败）};
+\node[term,right=18mm of G] (X3) {discard（复核失败）};
+
+\draw[->] (A)--(B);
+\draw[->] (B)--(C);
+\draw[->] (C)--(S1);
+\draw[->] (S1)--(D);
+\draw[->] (D)--node[right,font=\scriptsize]{GCD-clean（$\approx 0.09\%$）}(S2);
+\draw[->] (D)--(X1);
+\draw[->] (S2)--(E);
+\draw[->] (E)--node[right,font=\scriptsize]{干净}(F);
+\draw[->] (E)--(X2);
+\draw[->] (F)--(G);
+\draw[->] (G)--node[right,font=\scriptsize]{是}(H);
+\draw[->] (G)--(X3);
+\end{tikzpicture}
+\caption{两阶段 nonce 搜索流水线。便宜的解析经典预过滤（Stage-1）拒掉绝大多数 nonce；昂贵的
+精确 op-loop（Stage-2）只在 Stage-1 幸存者上运行；唯一的赢家在提交前由官方 CPU \c{eval_circuit}
+复核。（S2 节点标的 $\approx 169$/$1{,}355$ 是\emph{验证器在原始流上}的速率，\textbf{不是}两阶段里
+Stage-2 的吞吐——管线扫原始 nonce 的速率是 Stage-1 的、约 $100\times$ 于它；见 §\ref{ssec:twostage}
+``三个别混淆的速率''。）}
+\label{fig:flow}
+\end{figure}
+
+\subsection{流水线各组件（zan3 上、仓库内的文件）}
+表~\ref{tab:components} 列出各组件、其角色，以及它是否需要跑那条 10.3M-op 的 op-loop。
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.27\linewidth}p{0.30\linewidth}cp{0.20\linewidth}@{}}
+\toprule
+组件 & 角色 & 跑 op-loop？ & 速度量级 \\ \midrule
+\c{build()} / \c{src/point_add} & 生成 10.3M-op 流（\texttt{ops.bin}） & — & — \\
+\c{eval_circuit}（官方） & 读 \texttt{ops.bin}，全仿真，\textbf{认证器} & 是（CPU） & 仅最终赢家跑 1 次 \\
+\c{fast-screen}（CPU agent） & 进程内 build + 全仿真，1 nonce/进程 & 是（CPU） & $\approx 0.08$/核 \\
+\c{gcd.cu} / \c{gpu-nonce} & 解析\textbf{经典}预过滤（GCD replay） & \textbf{否}（快） & $\approx$8.6k--23.5k \\
+\c{verify_dual} / \c{hunt_phase.cu} & 融合 GPU \textbf{经典+相位}评测（精确） & 是（GPU） & $\approx 169$（8 卡 1{,}355）\\
+\c{circuit_prep} & 为 GPU kernel 导出重映射电路 & — & — \\
+\c{phase_ref} & CPU 金标准（FS + op-loop），与 \c{eval_circuit} 逐比特一致 & 是（CPU） & — \\
+\bottomrule
+\end{tabular}
+\caption{流水线组件。关键机制：\textbf{nonce 在 op-stream 里}（即 X;X 尾巴），而 \c{eval_circuit}
+读的是预建的 \texttt{ops.bin}，所以 CPU 校验某个 nonce 需要一份把该 nonce baked 进去的
+\texttt{ops.bin}；GPU kernel 则\textbf{在设备上把 nonce 吸收进 FS 哈希}（无需 rebuild），这正是
+GPU 能流式扫过数百万 nonce 的原因。}
+\label{tab:components}
+\end{table}
+
+\subsection{经济学}
+\textbf{经典}轴原则上可由一次\emph{便宜的解析 GCD replay}判定（无需跑电路）。\textbf{相位}轴则只能
+通过\emph{跑满 $\approx 10.3$M-op 的整条电路}来判定（相位依赖于每一个门，外加测量-uncompute 的
+RNG）。所以理想的流水线应当用便宜的解析 GCD 预过滤拒掉绝大多数 nonce，只对 GCD-clean 幸存者支付
+昂贵的 op-loop。\textbf{在 \texttt{1caf521} 实测}：\c{gcd.cu} 每 nonce 通过率 $\approx 0.09\%$（约
+$890$/M-nonce，即\emph{拒掉 $\approx 99.9\%$}），而它放过的 GCD-clean 候选里，只有 $\approx 20\%$ 在
+精确 op-loop 下\emph{真正}经典干净——其余 $\approx 80\%$ 是 apply 阶段截断造成的 false-clean
+（\c{gcd.cu} 只建模 GCD 求逆段，不管 apply，见后文``一个关于预过滤的微妙翻转''段）。
+
+\subsection{瓶颈}
+精确校验器对每个 nonce 都跑满整条 op-loop。实测速率（表~\ref{tab:rates}）表明 op-loop 就是瓶颈：
+它在\emph{每个} nonce 上都支付 $10.3$M-op 的代价，连那 $\approx 99.9\%$ GCD-hard 的也照付。
+
+\begin{table}[h]\centering
+\begin{tabular}{@{}llr@{}}
+\toprule
+评测器 & 硬件 & 速率（nonce/s） \\ \midrule
+CPU \c{fast-screen}（经典+相位全跑） & 1 核 & $\approx 0.08$ \\
+CPU \c{fast-screen} & 整个 fleet（$\approx$470 核） & $\approx 40$ \\
+GPU \c{gcd.cu} 经典预过滤 & 1 张 RTX-5090 & $\approx 8.6$k--$23.5$k \\
+GPU \c{verify_dual}（经典+相位 op-loop） & 1 张 RTX-5090 & $\approx 100$--$169$ \\
+GPU \c{verify_dual} & 8 张 RTX-5090 & $\approx 1{,}355$ \\ \bottomrule
+\end{tabular}
+\caption{各阶段实测吞吐。op-loop 校验器（底部）比解析经典预过滤（中部）慢约 $\sim 100\times$。}
+\label{tab:rates}
+\end{table}
+
+\paragraph{根本性的墙。}一个全新赢家需要约 $1/P(\text{dual-clean})$ 个 nonce，而
+$P(\text{dual-clean})$ 很小（在 \texttt{84d5b0e} 上 $\approx 3\times10^{-8}$，即一个新赢家要扫
+$\sim 10^7$--$10^8$ 个 nonce）。吞吐加速是\emph{线性}的——它按比例缩短墙钟时间，却无法让一个稀有岛
+候选变得``立刻''。因此战略性的杠杆是：（a）让便宜的预过滤拒掉更多；（b）挑选\emph{亚悬崖
+（sub-cliff）}候选，使其引入的硬输入数尽量小、从而让 $P$ 保持较高。
+
+% =====================================================================
+\section{为什么相位极难清零（优化的对偶代价）}
+\label{sec:whyphase}
+% =====================================================================
+相位通道是 nonce 搜索的绑定墙（$P(\text{pha}{=}0\mid\text{cls}{=}0)\approx e^{-10}$）。它为何如此
+难清零，有一个干净的结构性解释——\textbf{相位之难，正是 Toffoli 优化的对偶代价。}
+
+\paragraph{1. 纯经典-可逆电路本来没有相位。}只用 CX/CCX/X/Swap 的电路是一个\emph{置换}，它不
+产生相位。相位\emph{只}来自 Z-基门（CZ/CCZ/Z/Neg）与测量（Hmr/R）。可这条电路计算的是经典
+point-add（一个置换），按理不该有相位门——\textbf{然而它含约 84 万个 CZ}（本地实测：$840{,}611$ 个
+相干相位门）。
+
+\paragraph{2. 这些 CZ 是优化\emph{硬塞}进来的。}夺取前沿全靠把\textbf{昂贵的相干 uncompute
+（Toffoli）换成便宜的相位记账（CZ + 测量）}：
+\begin{itemize}[nosep]
+  \item \textbf{measured uncompute}：测量掉一个 ancilla（省 CCX），但测量留下相位 kickback，需用
+  CZ 修正抵消；
+  \item \textbf{phase-conditioned comparator replay}（\c{*_CONDITIONAL_REPLAY}）：不跑相干比较器，
+  而是测出比较标志并用 CZ 树\emph{replay}谓词以抵消相位（执行 Toffoli$\to 0$）；
+  \item \textbf{truncated / top-clean 算术}：截断加法器、边界清理用相位修正代替进位 uncompute。
+\end{itemize}
+实测的相位门分布印证了这一点（按 phase 区域桶分 $840{,}611$ 个 CZ，见表~\ref{tab:phasedist}）：
+它们集中在\textbf{apply chunk（$\approx 46\%$）与 round84 square（$\approx 17\%$）}——正是重度以相位
+技巧省 Toffoli 的相位。
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+相干相位门所在区域 & 占比 & 可便宜解析 replay？\\ \midrule
+apply chunk（boundary\_clear + clear + ripple） & $\approx 46\%$ & 否（需完整 apply 态） \\
+round84 square（forward + inverse） & $\approx 17\%$ & 否（需完整乘法态） \\
+apply double\_y / halve\_y & $\approx 7\%$ & 否 \\
+special folds（模约简） & $\approx 14\%$ & 部分 \\
+GCD 侧（tobitvector + branch\_bits） & $\approx 22\%$ & 是（GCD-step 量） \\
+\bottomrule
+\end{tabular}
+\caption{相干相位门（CZ/CCZ/Z/Neg，共 $840{,}611$）按电路 phase 区域的分布。约 $63\%$ 落在
+apply 与 square——其控制依赖完整量子态演化，无法像 GCD 那样被便宜地单独 replay。}
+\label{tab:phasedist}
+\end{table}
+
+\paragraph{3. 这些相位修正只在``可达 support''上精确。}每棵相位修正 CZ 树，都是按``输入必落在合法
+secp256k1 point-add 的可达取值语言内''设计为\emph{恰好抵消}的。但 $9024$ 个测试 shot 由 SHAKE
+\emph{随机}导出，会有输入\emph{飘出}该 support 一点点；在那些输入上相位抵消不完全 $\to$ \textbf{残留
+全局相位}。约 $10$ 个 shot 命中某个站点的 off-support 相位条件。要 $\text{pha}{=}0$ 即全部 $9024$
+个输入都避开\emph{所有}站点的相位破绽 $\to P\approx e^{-(\text{均值})}\approx e^{-10}$，故稀有。
+
+\paragraph{4. 为何与经典独立（$\text{leak}\approx 1$）。}相位\emph{只}影响全局相位，不影响所计算的
+\emph{值}。一个 off-support 输入可以\textbf{值算对}（classical clean），但那棵假设了它 bit 模式的 CZ
+修正树仍\emph{留下残相位}。值对、相位错——二者在\emph{不同}的 off-support 条件上失败，故独立。
+
+\paragraph{5. 为何相位比经典更难清零。}经典硬输入主要来自\textbf{截断}（被丢的位非零）——结构化、
+相关（双峰：一个 island 要么整体避开、要么不），且有便宜的 GCD-replay 模型可富集，故
+$P(\text{cls}{=}0)\approx 18\%$（不难）。相位硬输入则来自\textbf{散布全电路 $840$k 个 CZ 站点的抵消
+失败}——各站点独立贡献一小撮 $\to$ 更像 $\text{Poisson}(\sim 10)$，\emph{无双峰逃逸}；且散在
+apply/square，\textbf{无便宜解析模型}可富集（实测确认：关闭全部 measured-uncompute 后相位均值仍
+$\approx 10.6$ 不变 $\Rightarrow$ 相位源是相干 CZ，而非测量；而 CZ 的控制需完整态，无法便宜
+replay）。所以相位\emph{既本质更深、又无法预过滤}。
+
+\paragraph{6. 最深的反讽：越优化，相位越难。}\textbf{相位之难，正是 Toffoli 优化的代价。}前沿电路被
+优化到极致——到处把 Toffoli 换成相位修正——所以它的相位对应地极难保持干净。\emph{越想 beat
+frontier（更多优化、更多截断/replay），相位墙越高}，而非越低。这就是没有``躲相位''捷径的根本原因：
+相位之难是高度优化电路的内在属性，而不是某个可绕开的工具缺陷。
+
+% =====================================================================
+\section{\texttt{ecdsafail-agent} 如何攻克这些瓶颈}
+% =====================================================================
+
+\subsection{把 validator 搬上 GPU（直接打掉瓶颈）}
+\label{ssec:gpuval}
+§4 指出瓶颈就是那条精确 validator（op-loop）。历史上 validator 是 CPU \c{fast-screen}（即便整个
+$\approx 470$ 核的 fleet 也只有 $\approx 40$ nonce/s）。首要的攻克手段是\textbf{把整个 validator
+——完整 $10.3$M-op 电路、经典\emph{与}相位、全 $9024$ shot——整体搬到 GPU 上}，即
+\c{verify_dual} / \c{hunt_phase.cu}（在设备端把 nonce 吸收进 FS 哈希，无需 rebuild）：
+$\approx 169$ nonce/s/卡、8 卡 $\approx 1{,}355$ nonce/s，约为整个 CPU fleet 的 $\mathbf{34\times}$。
+这是基础；其上再用两阶段切分（§\ref{ssec:twostage}）确保昂贵的 op-loop 只在便宜预过滤的幸存者上跑。
+（这一点也是本仓库相对竞品 \texttt{ecdsafail\_gpu\_toolkit} 的关键差异，详见 §\ref{sec:borrow}。）
+
+\subsection{解析预过滤：不跑 op-loop 就筛掉绝大多数 nonce}
+\label{ssec:prefilter}
+GPU validator 把 op-loop 加速了 $34\times$，但 op-loop 本身仍然昂贵——它要在 $\approx 1168$ 个 qubit
+上把 $10.3$M 个 op 整体演化一遍。第二个攻克手段是\textbf{对绝大多数 nonce 干脆不跑 op-loop}：注意
+\emph{经典}判决（GCD 模逆是否正确）由一个\textbf{局部子计算}决定——二进制-GCD 在 $(u,v)$ 上的递推
+——它可以\emph{纯经典地} replay（几个 256-bit 整数，\textbf{不需要任何量子态演化}）。
+
+\paragraph{它具体怎么做。}\c{gcd.cu}（移植自 \c{dialog_gcd_classical_filter.rs}）对每个 shot、每个
+GCD 因子 $f$（$dx=P_x{-}Q_x$ 与 $c=Q_x{-}R_x$，两个都查；只查 $dx$ 会把硬率低估约 $2\times$）做如下
+纯整数重放——它\emph{就是硬件那条二进制-GCD walk 的整数复刻}，逐步施加\textbf{与电路完全相同的截断}：
+\begin{enumerate}[nosep]
+  \item \textbf{初始化} $u=p$（secp256k1 素数），$v=f$。
+  \item \textbf{重放 \c{ACTIVE_ITERATIONS}$=258$ 步}，每步：
+  \begin{itemize}[nosep]
+    \item 取该步的截断宽度 \c{active_width(step)} 与截断比较位 \c{compare_bits}；用\emph{截断}比较器
+    算分支位 $\textit{trunc\_gt}=\text{cmp\_gt\_truncated}(u,v)$——\textbf{硬件就是按这个截断决定走的}，
+    所以这里也按它走（截断-vs-全宽比较器即便不一致也\emph{不}判 hard：硬件跟随截断决定，在可达
+    support 上仍走到正确逆元，强行标记会误杀真干净 island）；
+    \item $b_0=\text{bit}_0(v)$，$b_0{\wedge}b_1 = b_0 \wedge \textit{trunc\_gt}$；若成立则在 cswap
+    宽度内条件交换 $(u,v)$；
+    \item 若 $b_0$：$v \leftarrow (v-u)$ 截断到 \c{body_carry_trunc_width}（带 odd-$u$ lowbit
+    fastpath 的 $\oplus 1$）——\emph{这一步就是电路里截断进位的体现}；
+    \item 右移 $v$（GCD 的折半）；若 K2 再做一次条件右移（$s_2=\lnot\text{bit}_0(v)$）；
+    \item \textbf{记录该步决策} $(b_0,\ b_0{\wedge}b_1,\ s_2)$ 进 transcript。
+  \end{itemize}
+  \item \textbf{两个 hard 判据}（任一触发即此 shot 在该因子上 hard）：
+  \begin{enumerate}[label=(\alph*),nosep]
+    \item \textbf{不收敛}：258 步后 \emph{终态 $u\neq 1$}——截断把这个输入的 walk 带偏了、没归到
+    $\gcd{=}1$（\c{NonConvergence}）。\emph{这一项自然地兜住了截断错误}：若某个被电路丢掉的位对这个
+    输入其实非零，截断 walk 就不会正确收敛。
+    \item \textbf{transcript 离语言}：把前 5 步决策打包成 \texttt{HEAD11} 的 15-bit pattern、后 3 步
+    打包成 \texttt{TAIL3} pattern，查它们是否在编解码器的\emph{可达语言}内（电路用压缩 sidecar 存这条
+    决策日志，codec 只在可达 pattern 上可逆）；离语言 $\Rightarrow$ \c{HeadK5Mismatch} /
+    \c{Tail3Top32Mismatch}——电路的压缩日志会非可逆。
+  \end{enumerate}
+  \item 该 shot \textbf{clean} 当且仅当 $dx$ 与 $c$ 都不 hard；整个 nonce GCD-clean 当且仅当全部
+  $9024$ shot 都 clean。
+\end{enumerate}
+\textbf{为什么便宜}：每 shot 只是 $258$ 步 $\times$ 每步几个 256-bit 整数运算（比较/减/移位/打包），
+\emph{没有 $1168$-qubit 态、没有 $10.3$M-op 演化}——故达 $\approx$8.6k--23.5k nonce/s（约 op-loop
+的 $\mathbf{100\times}$），在 classical-GCD 轴上\textbf{拒掉 $\approx 99.9\%$}，只把 GCD-clean 的
+$\approx 0.09\%$ 交给 Stage-2。\textbf{保守}（$0$ false-hard：它走的就是硬件的截断决策，绝不拒掉真
+赢家），但\emph{不精确}：它只重放 GCD 求逆段、\textbf{不重放 apply 阶段}，所以放过的 GCD-clean 里只
+$\approx 20\%$ 在精确 op-loop 下真正经典干净，其余 $\approx 80\%$ 是 apply 阶段截断的 false-clean
+（见后文``微妙翻转''段）。
+
+\subsection{两阶段 GPU 流水线（Lever~B）}
+\label{ssec:twostage}
+把以上两半合起来——\textbf{便宜的解析预过滤}（§\ref{ssec:prefilter}）作 Stage-1、\textbf{GPU
+validator}（§\ref{ssec:gpuval}）作 Stage-2——就是两阶段流水线（见图~\ref{fig:flow}）：
+\begin{itemize}[nosep]
+  \item \textbf{Stage 1}——\c{gpu-nonce}/\c{gcd.cu} 解析预过滤：拒掉 $\approx 99.9\%$，不跑 op-loop。
+  \item \textbf{Stage 2}——\c{verify_dual}/\c{hunt_phase.cu} 精确 GPU op-loop，\emph{只对 Stage-1
+  幸存者}运行，逐 batch 在第一个经典或相位失败处早退，产出 \c{DUAL_CLEAN_CANDIDATE}。
+  \item \textbf{复核}——唯一的赢家在提交前由官方 CPU \c{eval_circuit} 重新认证。
+\end{itemize}
+
+\paragraph{三个别混淆的速率。}图~\ref{fig:flow} 与表~\ref{tab:rates} 里的 \textbf{$\approx 169$
+nonce/s/卡（8 卡 $\approx 1{,}355$）是 op-loop 验证器跑在【原始 nonce 流】上的速率}——即\emph{单阶段}
+（对每个 nonce 都跑 op-loop、大多数在 classical 早退）的瓶颈数，也是把 validator 搬上 GPU 相对 CPU
+fleet（$\approx 40$/s）的 $34\times$ 之处。\textbf{它不是两阶段里 Stage-2 的吞吐}：
+\begin{itemize}[nosep]
+  \item \textbf{管线扫【原始 nonce】的速率}由 Stage-1 主导：$\approx$8.6k--23.5k/卡（8 卡
+  $\approx$7--19 万/s）——这才是``扫了多少 nonce''。
+  \item \textbf{Stage-2 处理【候选】的速率}：$\approx 2.7$/卡（8 卡 $\approx 22$ 候选/s；实测 $900$
+  候选 $\approx 335$ s）。注意它\emph{比 $169$/卡 慢}——GCD-clean 候选是 cls-clean 的，在 op-loop 里
+  \emph{跑得更深}（到相位失败 $\approx$batch 8、或更晚的经典才早退），而随机 nonce 大多在经典极早退；
+  但 Stage-2 只需处理 $\approx 0.09\%$ 的幸存者，故毫不吃力。
+\end{itemize}
+一句话：$1{,}355$ 是\emph{单阶段验证器}在原始流上的速率（两阶段正是要绕开它）；两阶段实际扫 nonce 的
+速率是 Stage-1 的、约 $100\times$ 于它。
+\subsection{工具对齐门：信任任何 GPU verdict 的前提}
+\label{ssec:gate}
+GPU 工具按 path 链接 \c{quantum_ecc}，因此它们在设备上跑的是电路的\emph{自有一份拷贝}。其判决要
+有效，这份拷贝必须与官方 \c{build_circuit} 的电路\textbf{逐 op 一致}：既然测试岛是
+$\text{SHAKE256}(\text{op-stream})$，op-stream 哪怕差一个 op，\emph{每个 nonce 的岛都不同}，于是
+\textbf{每一个经典/相位判决都失效}（在失准工具上 hunt，即便扫到赢家也无法确认）。两种常见的分叉来源
+——都靠下面的对齐门拦截：(a) \textbf{陈旧编译的依赖}：Cargo 增量编译可能在源码已变后仍链接旧的
+\c{build()}（二进制 mtime 看着新、依赖却没重编）——规则是改 \c{src} 后 \c{cargo clean} + 重建
+（日志须出现 \texttt{Compiling quantum\_ecc}）；(b) \textbf{旋钮未校准}（见 §\ref{ssec:calib}）。
+
+\paragraph{对齐门（强制前置检查）。}信任任何 GPU 判决之前，先确认一个\textbf{已知干净的 baked
+nonce 被工具读成双重干净}。因 \c{NONCE_BITS}$=48$，测其低 48 位（如 $2150000021998006 \bmod 2^{48}
+= 179675185023414$）。这是 per-channel-zero 思想的对齐版：一个定义上 $0/0/0$ 的 nonce 必须被工具确认
+$0/0/0$，否则工具与官方电路不对齐——\textbf{停下重对齐，不要 hunt}。（注意：\c{circuit_prep} 的
+n\_ops 与 \c{build_circuit} 的 total\_ops 之差\emph{不是}可靠判据——前者是 slot 压缩计数；以对齐门
+为准。）
+
+\subsection{对改比较器的候选做 filter 校准}
+\label{ssec:calib}
+凡是改了预过滤所建模的比较器的候选（例如 \c{DIALOG_GCD_COMPARE_BITS} $46{\to}45$），必须\emph{同时}
+重建 GPU dump（\c{circuit_prep}）\emph{和} Stage-1 filter，并\emph{校准到新旋钮}（把该旋钮 export
+给 \c{circuit_prep}、\c{gpu-nonce}、\c{verify_dual} 三者）。用 cb-46 校准的 filter 去扫 cb-45 的
+电路，会得到一批校验后卡在很高经典地板上的候选——这是一个伪装成``死候选''的\emph{假结构地板}。
+
+\subsection{投 fleet 前的筛选与判定（约 10 分钟预检）}
+\label{ssec:screen}
+把以上各零件拼成一条\textbf{投多小时 fleet hunt 之前的预检流程}，回答``这个候选值不值得、能不能
+hunt''。这套筛选思路借自 \texttt{ecdsafail\_skills}（§\ref{sec:borrow}），现已是本仓库 hunt 的标准
+前置——它正是把对齐门、filter 校准、通道诊断、运行时模型这些零件按顺序串起来用：
+\begin{enumerate}[nosep]
+  \item \textbf{分数筛（值不值）}：build 候选 $+$ \c{eval_circuit}（任意 nonce 即可，失败也会报
+  avg-T 与 $q$）$\Rightarrow$ 确认 $\text{avg\_T}\times\text{peak}<$ 前沿。
+  \item \textbf{对齐门（工具可不可信）}：§\ref{ssec:gate}——已知干净 baked nonce 必须读成
+  dual-clean，否则停下重对齐。
+  \item \textbf{建校准的 dump $+$ filter}：§\ref{ssec:calib}——把候选旋钮 export 给
+  \c{circuit_prep} / \c{gpu-nonce} / \c{verify_dual}。
+  \item \textbf{小批扫描}：扫 $\sim$12M nonce（几分钟）$\Rightarrow$ 收 $\sim$900 个 GCD-clean 幸存者。
+  \item \textbf{\c{verify_dual} 这 $\sim$900 个}（单卡 $\sim$5 min）$\Rightarrow$ 得通道分布
+  \texttt{dual / cls / pha}。
+  \item \textbf{读判定}：用下面的逐通道诊断（本节余下）$+$ §\ref{ssec:rt} 的 ETA $\Rightarrow$
+  \textbf{GREEN（投 fleet）/ RED（弃）}，并报 $p50/p90/p99$。
+\end{enumerate}
+要点：老办法跳过这 6 步、直接盲投 fleet，出不了赢家时分不清是\emph{工具坏 / 结构死 / 只是深}；这套
+预检在烧几小时算力前就把三者分开。下面先展开第 6 步的判定诊断，再给 ETA 模型，最后是一个完整实例。
+
+\subsubsection*{第 6 步：逐通道诊断——``我该不该继续 hunt？''}
+\label{ssec:chan}
+判定就是让上一步的 $\sim 900$ 个 Stage-1 幸存者（已通过对齐过的 \c{verify_dual}）的通道结构来回答：
+\begin{itemize}[nosep]
+  \item \textbf{leak} $q = P(\text{pha}{=}0 \mid \text{cls}{=}0)$——经典干净里同时相位干净的比例。
+  在 \texttt{1caf521} 实测：\textbf{leak $\approx 1$}（$\approx 180$ 个 cls-clean 中 $0$ 个
+  pha-clean）。\emph{相位是一条独立的绑定通道；GCD 预过滤完全不富集它。}因此 hunt 是
+  相位-eval 受限的——光加 Stage-1 GPU 没用。
+  \item \textbf{结构地板 vs.\ 深尾}——把候选的画像（cls-clean 比例、leak、failbatch 谱）与一个
+  \emph{已知可 hunt 的基线}（即 live frontier 本身）对比。若一致，候选就是深统计尾（可 hunt，只是
+  稀有），而非死路。严格版是\emph{失败-shot 重叠测试}：导出若干低-cls 候选的失败-shot 下标——若总是
+  同一批 shot 复现 $\Rightarrow$ 结构地板（放弃）；不同 shot $\Rightarrow$ 统计尾（继续 hunt）。
+  \item 注意 $900$ 个候选里 $0$ 个双重干净\emph{不等于}``没有赢家''：可用的 frontier 自己在该分辨率
+  下也是 $0/900$；它的赢家是在数百万个 nonce 上扫出来的。这正是深尾的特征。
+\end{itemize}
+
+\subsection{标定的运行时模型}
+\label{ssec:rt}
+把``到岛时间''建模为带经验修正的两阶段漏斗：
+\[
+  \text{island\_rate} = d \cdot P(c{=}0)\cdot P(p{=}0\mid c{=}0)\cdot P(a{=}0\mid c{=}0,p{=}0),
+  \qquad
+  E[N] \approx k\cdot \frac{1}{\text{island\_rate}},
+\]
+其中 $d=e^{-\lambda_{\text{GCD}}}$ 是 Stage-1 通过密度（由全-nonce 的 GCD-hard 均值估计，而非由稀有
+的零估计），通道零率用 Poisson 或负二项（针对过离散的、被筛过的子总体），$k=\text{median}
+(\text{actual}/\text{predicted})$ 从每次落地的 hunt 中学得。等待是指数分布的，故 $p99\approx
+4.6\times$ 均值——永远报告 $p50/p90/p99$，绝不只报均值。
+
+\subsection{Worked example：候选 \texttt{cb45}（\texttt{COMPARE\_BITS} $46{\to}45$）}
+新方法被用在一个\emph{旧}方法曾 hunt 失败的候选上：
+\begin{itemize}[nosep]
+  \item \textbf{分数}：相对 cb-46 基线 $-201{,}076$（更小的比较器，在 $q{=}1168$ 不变下 $-172$ 平均
+  Toffoli）——分数为负，值得 hunt。
+  \item \textbf{可 hunt 性}：用修好且校准过的工具，cb-45 的通道画像（$179$ cls-clean/$900$，leak
+  $\approx 1$，最大 failbatch $43/141$）与可 hunt 的 cb-46 前沿（$180/900$，最大 failbatch $48$）在
+  统计上一模一样 $\Rightarrow$ \textbf{cb-45 是深尾，而非死路}。旧的失败归因于陈旧工具和/或一个
+  校准错位的 filter——两者在此都已修复。
+\end{itemize}
+
+\subsection{把整条搜索加速的杠杆（按收益排序）}
+表~\ref{tab:levers} 列出可加速\emph{整条}搜索的杠杆。要点是把那条根本性的墙（$P(\text{dual-clean})$
+很小，是\emph{线性}加速治不好的）与那些确实把墙钟时间砍下来的工程杠杆区分开。
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.34\linewidth}p{0.20\linewidth}p{0.12\linewidth}p{0.22\linewidth}@{}}
+\toprule
+杠杆 & 收益 & 工作量 & 状态 \\ \midrule
+修正经典预过滤的过严/欠拒（让其硬输入模型匹配真实电路，且保持 $0$ 假干净），把昂贵 op-loop 只留给
+幸存者 & $\sim 5$--$10\times$ 系统吞吐 & 高 & 开放——真正的杠杆 \\
+\textbf{多 GPU 独立进程}（每卡一个 \c{verify_dual}，不相交范围，绕开损坏的 8-卡同步） & 最高 $8\times$ &
+低 & 已完成模式 \\
+减小 \c{verify_dual} 每线程状态（gather buffer / tile state），提升 occupancy & $1.5$--$3\times$
+单卡 & 中 & 开放 \\
+\textbf{加机器}——把 zan5（8$\times$RTX-5090）同步到同一前沿，照样跑独立进程 fleet & $+8$ 卡（$\approx
+2\times$） & 低 & 开放 \\
+\textbf{分级 shot}——先用子集（512$\to$2048）做相位校验，幸存者再升到全 9024 & 常数因子 & 中 &
+部分（已有逐 batch 早退） \\
+\textbf{廉价-RNG 相位预过滤}——相位 garbage 对任意 RNG 都会触发，故用快速 xorshift 替代 SHAKE 做一遍
+预过滤，幸存者再交 CPU 复核 & 削减 keccak 负载 & 中 & 开放 \\
+\bottomrule
+\end{tabular}
+\caption{加速整条搜索的杠杆。\textbf{根本极限（非 bug）}：$P(\text{dual-clean})$ 很小，无论扫得多快，
+一个新赢家都需要 $\sim 10^7$--$10^8$ 个 nonce。以上加速都是线性的——它们按比例缩短墙钟（例如 8 卡在
+``修好预过滤''后的速率下，可把一次 $\sim 20$ 小时的 hunt 缩到 $\sim 1$--$2$ 小时），却无法让稀有岛
+候选``立刻''。挑选\emph{亚悬崖 / 值精确}的候选（更少的新增硬输入 $\to$ 更高的 $P$）才能让 hunt 变短。}
+\label{tab:levers}
+\end{table}
+
+\paragraph{一个关于预过滤的微妙翻转（值得记录）。}在 \texttt{84d5b0e} 上，CPU filter 模型曾经
+\emph{过严}（把硬度高估约 $3.3\times$，几乎不给任何富集）。到 \texttt{1caf521}，情况\emph{翻转}了：
+\c{gcd.cu} 现已有正确的 \texttt{HEAD11} 编解码器（与 CPU 支持表逐字节一致，且 $dx$/$c$ 两个因子都
+查），它不再过严——反而\emph{欠拒绝}：$\sim 900$ 个 GCD-clean 候选里只有 $\approx 20\%$ 在 op-loop
+下真正经典干净（其余 $\approx 80\%$ 是 false-clean）。原因是 \c{gcd.cu} 只建模 GCD 求逆段的硬输入，
+不管完整 point-add——一个 nonce 可以 GCD-clean 却经典脏，坏在 APPLY 阶段的截断或下游算术，而这些
+GCD replay 并不建模。让它精确 = 把 apply 阶段也解析建模（工作量大、收益有限，因为真正的墙是深相位
+尾 / leak $\approx 1$）。它仍然安全（无 false-HARD：绝不拒掉真赢家），所以照现状仍是个有效的富集预
+过滤器。
+
+% =====================================================================
+\section{从两个同行仓库借鉴的思路}
+\label{sec:borrow}
+% =====================================================================
+
+研究了两个同行仓库：\texttt{ecdsafail\_skills}（一个 7-skill 的 agent 库）与
+\texttt{ecdsafail\_gpu\_toolkit}（一个 GPU 岛-hunting 工具箱）。表~\ref{tab:borrow} 汇总了采纳了
+什么、各解决了什么。
+
+\subsection{来自 \texttt{ecdsafail\_skills}}
+\begin{itemize}[nosep]
+  \item \textbf{逐通道-零 go/no-go}（\c{cls}/\c{pha}/\c{anc} 三通道分解）：每条通道都必须独立地在
+  \emph{某处}达到 $0$，否则 $0/0/0$ 在结构上不可达。\emph{解决}：对死路的廉价提前枪毙，以及揭示出
+  ``相位是这里的绑定通道''这一框架。
+  \item \textbf{失败-shot 重叠测试}：区分结构地板（每个 nonce 都同一批 shot 失败）与深统计尾（不同
+  shot）。\emph{解决}：盲 hunt 永远回答不了的``继续 hunt 还是放弃''——这正是我们能宣告 cb-45 可 hunt
+  而非死路的依据。
+  \item \textbf{标定的两阶段运行时模型}（条件漏斗；Poisson/NB 离散；常数 $k$；$p50/p90/p99$）。
+  \emph{解决}：诚实的 ETA 以及对候选的相对排序，取代了只看密度的乐观估计。
+  \item \textbf{双因子预过滤}：一个 shot 只要\emph{任一} GCD 因子（$dx$ 或 $c$）硬就算硬；只查 $dx$
+  会把硬率低估 $\approx 2\times$、产出假干净岛。\emph{解决}：确认 Stage-1 预过滤确已检查两个因子——一条
+  必须保持的正确性不变式。
+  \item \textbf{已归档的死路与前沿考古}：jumpdivsteps NO-GO、\c{WIDTH_SLOPE} 密度悬崖（$\sim
+  25\times$/notch）、批量对偶求逆的亏损、\texttt{ops.bin} 缓存陷阱、ZX/T-par 零抵消；外加前沿阶梯与
+  双钉峰情报。\emph{解决}：阻止我们重走已证死路，并标定下一个真正的赢点在哪。
+\end{itemize}
+
+\subsection{来自 \texttt{ecdsafail\_gpu\_toolkit}}
+\begin{itemize}[nosep]
+  \item \textbf{两阶段 scan$\to$validate 纪律}与\textbf{密度门控}（candidates/M-nonce 阈值）。
+  \emph{解决}：在投入 GPU 小时之前有原则的 stop/go。
+  \item \textbf{惰性求值``apply 预扫''}（\c{EVAL_FAST_REJECT}）：与其在 GPU 上重新实现 apply 阶段，
+  不如让受信任的 CPU \c{eval_circuit} 快速失败。\emph{对照}：我们的工具箱下了相反的赌注——它把相位
+  op-loop \emph{放在 GPU 上}跑（\c{hunt_phase} kernel）以产出真正双重干净的候选——但惰性求值这个想法
+  作为更便宜的回退仍值得保留。
+  \item \textbf{把旋钮当作精确加速的卫生学}：批量模逆（\c{GPU_BATCH_INV}）、运行时定基 comb 表
+  （\c{GPU_COMB_BITS}）、安全的 GCD 重排（\c{trunc_first}）、nonce-fan SHAKE 缓存——每个都是带正确性
+  冒烟测试的精确开关。\emph{解决}：一套在不冒假阴性风险下添加加速的模板。
+\end{itemize}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.30\linewidth}p{0.18\linewidth}p{0.44\linewidth}@{}}
+\toprule
+借鉴的思路 & 来源 & 在这里解决了什么 \\ \midrule
+逐通道-零 go/no-go & skills & 廉价枪毙死路；发现相位是绑定通道 \\
+失败-shot 重叠测试 & skills & 结构地板 vs 深尾的判定（cb-45 被判为可 hunt） \\
+标定运行时模型 & skills & 诚实 ETA + 候选排序；尾部分位数 \\
+双因子预过滤 & skills & 确认并锁定 $dx \lor c$ 硬输入不变式 \\
+死路 + 考古 & skills & 避免重走已证死路；前沿情报 \\
+两阶段 + 密度门控 & toolkit & 投 GPU 小时前的有原则 go/no-go \\
+惰性求值快速拒绝 & toolkit & 比 GPU 相位 op-loop 更便宜的 CPU 侧回退 \\
+精确旋钮加速卫生学 & toolkit & 安全添加 GPU 加速的模板 \\
+\bottomrule
+\end{tabular}
+\caption{从两个同行仓库采纳的思路，以及各自解决的问题。}
+\label{tab:borrow}
+\end{table}
+
+\subsection{本仓库相对 \texttt{ecdsafail\_gpu\_toolkit} 的关键领先}
+借鉴并非单向——本仓库在 GPU 工具上有两处竞品工具箱\emph{没有}的能力：
+\begin{itemize}[nosep]
+  \item \textbf{GPU validator}：§\ref{ssec:gpuval} 所述``把完整 classical+phase op-loop 搬上 GPU''
+  正是关键差异——竞品 \texttt{ecdsafail\_gpu\_toolkit} \emph{只}把 Stage-1（GCD 预过滤）放 GPU，把
+  Stage-2 的昂贵 validate 留在 \textbf{CPU}（用 \c{EVAL_FAST_REJECT} 让 CPU \c{eval_circuit} 快速
+  失败，刻意不在 GPU 重写 apply/phase）。即本流水线\textbf{两阶段都在 GPU}，竞品只有 Stage-1 在 GPU
+  ——这正是相位通道能被\emph{流式}校验、不必回落 CPU fleet 的原因。
+  \item \textbf{更快的经典预过滤内核（$\approx 2\times$）}：本仓库 \c{gcd.cu} 达 $\approx 23.5$k
+  nonce/s（\c{HC=8} 批量模逆 + 16-bit comb 表 + \c{launch_bounds} 调优），约为竞品（$\approx
+  10$--$12$k）两倍。
+\end{itemize}
+\emph{取舍}：GPU 相位 op-loop 很重（$\approx 169$ nonce/s）——这正是两阶段（便宜预过滤 $\to$ 仅对
+幸存者跑 op-loop）必要性的来源；竞品的``惰性 CPU 求值''是一个值得保留的、更便宜的 Stage-2 回退。
+
+% =====================================================================
+\section{新工作流为何更好（之前 $\to$ 现在）}
+% =====================================================================
+表~\ref{tab:beforeafter} 把本轮修复前后的工作流并排对比，凸显从``盲 hunt 碰运气''到``先筛选、
+判定、再投 fleet''的转变。
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.16\linewidth}p{0.38\linewidth}p{0.38\linewidth}@{}}
+\toprule
+ & 之前（静默失败） & 现在（本轮） \\ \midrule
+陈旧工具 & hunt 跑在分叉电路上，判决全是垃圾；扫到赢家也确认不了 & \textbf{对齐门}（baked nonce $\to$
+双重干净）在 hunt 前就抓出来 \\
+改比较器旋钮 & 用错位 filter 扫 $\to$ 假结构地板 & 重建 dump + filter，\textbf{校准到该旋钮} \\
+``出不了赢家'' & 分不清结构死路 / 深尾 / 工具坏了 $\to$ 放弃了可 hunt 的候选或死磕死路 & \textbf{通道筛选}
+（leak + 对比 frontier 画像 + 重叠测试）在投 fleet 前给出判定 \\
+决策方式 & 盲 hunt，碰运气 & 筛选 $\to$ 判定 $\to$ 才投 fleet hunt；赢家用 CPU \c{eval_circuit} 复核 \\
+\bottomrule
+\end{tabular}
+\caption{修复前后的工作流对比。}
+\label{tab:beforeafter}
+\end{table}
+
+% =====================================================================
+\section{当前状态与开放项}
+% =====================================================================
+\begin{itemize}[nosep]
+  \item \textbf{工具链}：已修复（陈旧构建缺陷），并已对齐门校验。
+  \item \textbf{活跃 hunt}：\c{cb45}（$-201$k 分）正在 \texttt{zan3} 的 $8$ 卡上、用修复且 cb-45-
+  校准的两阶段流水线 hunt；赢家提交前 CPU 复核。
+  \item \textbf{已知限制}：Stage-1 预过滤只建模 GCD 求逆、不管 apply 阶段，所以它的``GCD-clean''候选
+  里约 $80\%$ 在 op-loop 下是经典脏。让它精确 = 解析地建模 apply 阶段（工作量大、收益有界，因为绑定
+  墙是深相位尾 / leak $\approx 1$）。
+  \item \textbf{最高杠杆的开放杠杆}：一次能\emph{塌缩 leak} 的电路侧改动（让测量-uncompute 相位只在
+  经典截断也失败的地方失败）——这会让便宜的经典预过滤同时富集两条通道。
+\end{itemize}
+
+\end{document}

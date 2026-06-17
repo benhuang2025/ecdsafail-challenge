@@ -1,0 +1,16 @@
+# Rust build artifacts
+**/target/
+target/
+
+# Compiled circuit / large binary data
+*.bin
+ops.bin*
+
+# Logs / scratch
+*.log
+*.tmp
+/tmp/
+
+# OS / editor
+.DS_Store
+*.swp
