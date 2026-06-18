@@ -15,15 +15,19 @@
 - **明确避开：** 任何让 λ_cand 明显高于 baseline 的截断（单次砍一整个 GCD iteration、square cleanup 砍太狠、WIDTH_MARGIN 砍太多）。这些的 phase 轴 filter 不 enrich → SQWIN-class 慢猎或 over-cliff 不可行。**screen 出 score-negative 不够，必须 Step-0 实测 λ_cand 确认 sub-cliff 才能 hunt。**
 
 **基本信息**
-- 控制节点 `zan3`，SSH 后 `cd /home/ubuntu/ben/temp/ecdsafail-challenge && export PATH=$HOME/.cargo/bin:$PATH`
+- 控制节点是 vast.ai RTX5090 GPU server，连接方法：
+  ```bash
+  ssh-add ~/.ssh/id_rsa
+  ssh -p 63190 root@74.48.78.46 -L 8080:localhost:8080 -A
+  ```
+  连上后 `cd /home/ubuntu/ben/temp/ecdsafail-challenge && export PATH=$HOME/.cargo/bin:$PATH`
 - 编辑权限：只能改 `src/point_add/`，禁止改 main.rs / circuit.rs / sim.rs / weierstrass / bin/* / Cargo* / rust-toolchain
 - **永远不要 `git push`**
 - agent 工具都在 `ecdsafail-agent/`（untracked）。**hunt 部署用两阶段 `ecdsafail-agent/gpu-nonce/leverB_hunt.sh`**（见 Phase 6；旧单阶段 `hunt/` 已归档到 `archive/`）。
-- **LAN fleet（3 台可靠机，hunt 全用它们）：**
-  - `zan3` 本地，GPU 0,1，~110 核
-  - `zan4` = `ubuntu@10.23.175.200`，共享 GPU（用 `GPULIST` 指定空闲卡），~120 核
-  - `zan5` = `ubuntu@10.23.147.174`，8× RTX5090，124 核
-  - zan3 通过 LAN ssh 到 zan4/zan5。**不要用 vast.ai/容器机**（xargs -P 串行、消费级 GPU scan 极慢，踩过坑）。
+- **单机 vast.ai RTX5090 box（hunt 全在这台上跑）：**
+  - 多卡 RTX5090，跑两阶段 `leverB_hunt.sh`（`NGPU`/`GPULIST` 选卡，`numactl` 绑 NUMA）。
+  - 现在的 hunt 是 GPU-bound 的 CUDA kernel（stage-1 ~8.6k nonce/s/GPU）+ `setsid &` 逐卡后台，**不依赖 `xargs -P`** → 旧 runbook 里「vast.ai 容器 xargs -P 串行 / 消费级 GPU scan 极慢」的坑只针对已归档的旧单阶段 pipeline（host-bound ~4800 nonce/s + 容器 xargs 串行），现在不适用。
+  - 容器注意：pytorch 模板可能缺 `numactl` / CUDA toolchain，hunt 前先确认。
 
 ---
 
@@ -211,7 +215,7 @@ displacement 是「一个随机岛」的单点采样，而且**对 GCD-轴截断
 **当前方法 = 两阶段 `ecdsafail-agent/gpu-nonce/leverB_hunt.sh`**（单机 8 卡；stage-1 gcd.cu 预过滤 → stage-2 verify_dual op-loop；详见 [gpu-nonce/LEVER_B_EXPLAINED.md](./gpu-nonce/LEVER_B_EXPLAINED.md)）。旧的单阶段 fleet 工具链 `hunt/`（`deploy.sh`/`node_hunt.sh`，单阶段 gpu-nonce + CPU fast-screen verify）**已归档到 `archive/`，不再用**。
 
 ```bash
-# 在 zan3 上。先 Step-0 确认 sub-cliff（Phase 5.5）！只部署确认过的候选。
+# 在 vast.ai 机器上。先 Step-0 确认 sub-cliff（Phase 5.5）！只部署确认过的候选。
 # 1) 改旋钮进 mod.rs（src/point_add/）+ unfreeze baked nonce → 重建 gpu-nonce（见 Phase 5）。
 # 2) 跑（GCD-轴 knob 必须前缀赋值，env 才透传进 circuit_prep+stage-1+verify_dual）：
 cd ecdsafail-agent/gpu-nonce
@@ -221,7 +225,7 @@ DIALOG_GCD_COMPARE_BITS=45 NGPU=8 START=<n0> CHUNK=20000000 CHUNKS=<n> \
 
 `leverB_hunt.sh` 每 chunk 自动：circuit_prep 刷新 `/tmp/phase_circuit` dump → stage-1 扫 → stage-2 verify_dual 在幸存者上跑 → 出 `DUAL_CLEAN_CANDIDATE`。
 
-**Fleet = 在 zan4/zan5 上各跑一份**，`START` 取 disjoint range（leverB 是单机的，没有两阶段 fleet 编排脚本，手动分区间）。zan4/zan5 需先 rsync 仓库 + 重建 gpu-nonce（或 scp 二进制 + `SKIP_PREP=1` 复用同电路 dump）。
+**单机多卡即整个 fleet**：`leverB_hunt.sh` 用 `NGPU`/`GPULIST` 把所有 RTX5090 一次性吃满，`START` 内部按 `STRIDE` 给每卡分 disjoint range，不用手动分区间。要进一步加吞吐只能加卡 / 加 verify 核，没有跨机编排（已不再用 LAN fleet）。
 
 巡检 / 停：
 - **dump 刷新后核对** `od -An -tu8 -N24 /tmp/phase_circuit/meta.bin` 的 n_ops == 你 knob 下 `build_circuit`（`DIALOG_TAIL_NONCE=none`）的 base ops —— 防静默跑 default 电路。
@@ -278,16 +282,13 @@ break-even ≈ avg_toffoli / peak_qubits（T/q）
 
 ---
 
-## 机器约束速查（LAN fleet）
+## 机器约束速查（vast.ai 单机）
 
-部署 = 每台跑两阶段 `gpu-nonce/leverB_hunt.sh`（Phase 6），`GPULIST` 选卡、`numactl` 绑 NUMA。手动单机操作时：
+部署 = 在这台上跑两阶段 `gpu-nonce/leverB_hunt.sh`（Phase 6），`NGPU`/`GPULIST` 选卡、`numactl` 绑 NUMA。
 
-| 机器 | host | GPU | 核 | 备注 |
-|---|---|---|---|---|
-| zan3 | 本地 | 0,1（共 8 卡，0/1 给 hunt） | ~110 | 控制节点；`numactl --cpunodebind=0 --membind=0` |
-| zan4 | ubuntu@10.23.175.200 | 共享，挑 mem<2G 的空闲卡 | ~120 | 别人也在用，别 kill 别人进程 |
-| zan5 | ubuntu@10.23.147.174 | 8× RTX5090 | 124 | 专用，可随便用 |
+| 机器 | 连接 | GPU | 备注 |
+|---|---|---|---|
+| vast.ai RTX5090 box | `ssh -p 63190 root@74.48.78.46 -L 8080:localhost:8080 -A`（先 `ssh-add ~/.ssh/id_rsa`） | 多卡 RTX5090（按 `nvidia-smi` 实际可见卡数设 `NGPU`/`GPULIST`） | 唯一节点；pytorch 模板，hunt 前确认 `numactl`/CUDA toolchain 已装 |
 
-- zan3 通过 LAN ssh 到 zan4/zan5（key auth）。Mac 端用 `ssh zan3 '...'` 驱动一切。
-- **手动跨机命令一律「写脚本文件 → scp → setsid 跑」，绝不内联嵌套 ssh heredoc**（引号会被吞、PATH 会丢 → 静默失败，踩过无数次）。
-- 纯 CPU 临时 verify 机不用 GPU/CUDA：scp `fast-screen` 二进制过去喂候选即可。
+- Mac 端用上面的命令连这台，连上后 `cd /home/ubuntu/ben/temp/ecdsafail-challenge && export PATH=$HOME/.cargo/bin:$PATH` 再驱动一切。
+- 单机操作，**无跨机 ssh**；后台进程一律 `setsid nohup ... &` 防 SIGHUP 断连即死。
