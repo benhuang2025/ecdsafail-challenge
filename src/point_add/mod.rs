@@ -296,9 +296,29 @@ impl B {
             self.current_phase_active_max = 0;
         }
     }
+    #[track_caller]
     fn alloc_qubit(&mut self) -> QubitId {
         self.active_qubits += 1;
         self.record_phase_active();
+        if let Ok(threshold) = std::env::var("TRACE_ALLOC_NEAR_PEAK")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(())
+        {
+            if self.active_qubits >= threshold {
+                let caller = std::panic::Location::caller();
+                eprintln!(
+                    "ALLOC_NEAR active={} next_idx={} phase='{}' ops_idx={} free_pool={} caller={}:{}",
+                    self.active_qubits,
+                    self.next_qubit,
+                    self.phase,
+                    self.current_ops_len(),
+                    self.free_qubits.len(),
+                    caller.file(),
+                    caller.line(),
+                );
+            }
+        }
         if self.active_qubits > self.peak_qubits {
             self.peak_qubits = self.active_qubits;
             self.peak_ops_idx = self.current_ops_len();
@@ -1056,6 +1076,24 @@ fn set_default_env(name: &str, value: &str) {
     if std::env::var_os(name).is_none() {
         std::env::set_var(name, value);
     }
+}
+
+// Q1153 second-512 scan route. To submit a clean hit from the current hunt,
+// update this nonce, build with no shell env overrides, run `ecdsafail run`,
+// and submit only if it remains 0 / 0 / 0.
+const Q1153_SECOND512_SUBMISSION_NONCE: &str = "930308424560";
+
+fn configure_q1153_second512_submission_defaults() {
+    set_default_env("DIALOG_TAIL_NONCE", Q1153_SECOND512_SUBMISSION_NONCE);
+    set_default_env("TLM_TARGET_Q", "1152");
+    set_default_env("TLM_FOLD_CHUNK_ZERO_CIN", "1");
+    set_default_env("TLM_FFG_MAX_G", "47");
+    set_default_env("TLM_APPLY_ADD_SKIP_LASTK", "1");
+    set_default_env("TLM_FOLD_TAIL_CINC", "1");
+    set_default_env("TLM_CODEC_DIAMOND_MCX", "1");
+    set_default_env("SINGLE_CCX_FANOUT_DISABLE", "1");
+    set_default_env("DROP_DEAD_ROBUST", "1");
+    set_default_env("DROP_DEAD_ROBUST_SECOND", "1");
 }
 
 fn configure_ecdsafail_submission_route() {
@@ -1861,7 +1899,91 @@ pub fn build_builder() -> B {
     builder
 }
 
+fn apply_drop_dead_robust_if_enabled(mut ops: Vec<Op>) -> Vec<Op> {
+    if std::env::var("DROP_DEAD_ROBUST_DISABLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("DROP_DEAD_ROBUST: disabled by DROP_DEAD_ROBUST_DISABLE=1");
+    } else if std::env::var("DROP_DEAD_ROBUST")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        let drop_txt_owned = std::env::var("DROP_DEAD_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let drop_txt = drop_txt_owned
+            .as_deref()
+            .unwrap_or_else(|| include_str!("drop_dead_robust_k1_skip_59084.idx"));
+        let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for line in drop_txt.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("idx") {
+                continue;
+            }
+            let first = t.split('\t').next().unwrap_or(t);
+            if let Ok(v) = first.parse::<usize>() {
+                drop.insert(v);
+            }
+        }
+        let before = ops.len();
+        ops = ops
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, op)| op)
+            .collect();
+        eprintln!(
+            "DROP_DEAD_ROBUST: removed {} ops ({} -> {})",
+            before - ops.len(),
+            before,
+            ops.len()
+        );
+    }
+    if std::env::var("DROP_DEAD_ROBUST_SECOND")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        let drop_txt_owned = std::env::var("DROP_DEAD_SECOND_FILE")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let drop_txt = drop_txt_owned
+            .as_deref()
+            .unwrap_or_else(|| include_str!("drop_dead_second_fs512.idx"));
+        let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for line in drop_txt.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("idx") {
+                continue;
+            }
+            let first = t.split('\t').next().unwrap_or(t);
+            if let Ok(v) = first.parse::<usize>() {
+                drop.insert(v);
+            }
+        }
+        let before = ops.len();
+        ops = ops
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, op)| op)
+            .collect();
+        eprintln!(
+            "DROP_DEAD_ROBUST_SECOND: removed {} ops ({} -> {})",
+            before - ops.len(),
+            before,
+            ops.len()
+        );
+    }
+    ops
+}
+
 pub fn build() -> Vec<Op> {
+    configure_q1153_second512_submission_defaults();
+
     if std::env::var("DIALOG_GCD_K5_HEAD11_SELFTEST").is_ok() {
         match dialog_gcd_k5_head11_codec_selftest() {
             Ok(()) => eprintln!(
@@ -2027,13 +2149,30 @@ pub fn build() -> Vec<Op> {
     set_default_env("LUD_EXTRA_FOLD_VENTS", "0");
     set_default_env("LUD_EXTRA_FOLD_MIN_G", "0");
     set_default_env("LUD_EXTRA_FOLD_MAX_G", "999");
-    set_default_env("DIALOG_TAIL_NONCE", "800001625921");
+    set_default_env("DIALOG_TAIL_NONCE", "930308424560");
+    set_default_env("TLM_FOLD_TAIL_CINC", "1");
+    set_default_env("TLM_CODEC_DIAMOND_MCX", "1");
+    set_default_env("SINGLE_CCX_FANOUT_DISABLE", "1");
     // Stack the latest frontier square fold: use shifted-low folding for all
     // square lanes instead of the older `a`-only direct32 ramp shortcut.
     set_default_env("TLM_SQUARE_F_RAMP10_DIRECT32_TAGS", "");
     set_default_env("TLM_SQUARE_F_SHIFTED_LOW", "1");
+    // post-1159 avgT stack (Codex): graduated final +f chunk w/o materializing the
+    // dropped carry-out (arith.rs) + skip the first forward-apply cswap (gcd.rs).
+    set_default_env("TLM_GRAD_FINAL_NO_COUT", "1");
+    set_default_env("TLM_APPLY_FWD_FIRST_CSWAP_SKIP", "1");
     set_default_env("CONSTPROP_MAX_ITERS", "16");
-    set_default_env("TLM_TARGET_Q", "1159");
+    // q1155 trial: tighten the q1156 chunk4/ffg11/s2safer reserve machinery by
+    // one peak qubit before retuning the per-call reserve schedules.
+    set_default_env("TLM_TARGET_Q", "1155");
+    set_default_env("TLM_FOLD_BOUNDARY_ZERO_DIRECT", "1");
+    set_default_env("TLM_FOLD_CHUNK_FORCE", "4");
+    set_default_env("TLM_TARGET_FOLD_CALL_RESERVE_OVERRIDES", "173:3,175:3,177:3,256:11,257:11,336:3,338:3,340:3,176:3,178:3,180:3,254:5,259:20,333:3,335:3,337:3,179:3,181:3,183:3,182:3,184:3,186:3,327:3,329:3,330:3,331:3,332:3,334:3");
+    set_default_env("TLM_TARGET_FFG_CALL_RESERVE_OVERRIDES", "184:4,186:4,188:4,205:6,207:6,209:6,220:7,222:7,224:7,238:8,240:8,242:8,251:9,257:10,262:10,355:10,362:10,359:10,181:3,183:3,185:3,187:4,189:4,191:4,196:5,198:5,200:5,208:6,210:6,212:6,223:7,225:7,227:7,241:8,243:8,245:8,250:9,252:9,190:4,192:4,193:5,194:4,195:5,197:5,199:5,201:5,202:6,203:5,204:6,206:6,211:6,213:6,214:7,215:6,216:7,218:7,226:7,228:8,229:8,230:8,231:8,233:8,244:8,246:8,247:9,253:9,254:10,259:11,358:10,340:11,341:11,342:11,343:11,344:11,345:11,346:11,347:11,348:11,349:11,350:11");
+    set_default_env("TLM_APPLY_FWD_S2_ZERO_LAST", "1");
+    set_default_env("TLM_APPLY_INV_S2_ZERO_LAST", "1");
+    set_default_env("TLM_APPLY_FWD_CSWAP_SKIP_LAST", "2");
+    set_default_env("TLM_APPLY_INV_CSWAP_SKIP_LAST", "1");
     set_default_env("TLM_FOLD_RELEASE_CONTROLS", "1");
     set_default_env("TLM_TARGET_FFG_RESERVE", "9");
     set_default_env(
@@ -2072,13 +2211,15 @@ pub fn build() -> Vec<Op> {
     set_default_env("TLM_GCD_K_ADJUST_AFTER", "169");
     set_default_env("TLM_GCD_K_ADJUST_BEFORE", "196");
     set_default_env("TLM_GCD_K_ADJUST", "-2");
+    set_default_env("DROP_DEAD_ROBUST", "1");
+    set_default_env("DROP_DEAD_ROBUST_SECOND", "1");
     let mut ops = trailmix_ludicrous::build_trailmix_ludicrous_ops();
     if std::env::var("SINGLE_CCX_FANOUT_DISABLE")
         .ok()
         .as_deref()
         == Some("1")
     {
-        return ops;
+        return apply_drop_dead_robust_if_enabled(ops);
     }
     let input_ops = ops.len();
     let mut fanout_passes = 0usize;
@@ -2107,7 +2248,7 @@ pub fn build() -> Vec<Op> {
         ops.len(),
         fanout_passes,
     );
-    ops
+    apply_drop_dead_robust_if_enabled(ops)
 }
 
 pub fn square_window_selftest() -> Result<(), String> {

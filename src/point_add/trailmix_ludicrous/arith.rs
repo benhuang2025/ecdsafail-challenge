@@ -66,9 +66,9 @@ pub const F_BITLEN: usize = 33;
 /// Profile padding.
 pub const PAD: usize = 19;
 /// `+f` fold window width: carry beyond bit `LSBS-1` is dropped (~2^-PAD miss).
-pub const LSBS: usize = PAD + F_BITLEN; // 54
+pub const LSBS: usize = 20 + F_BITLEN; // baseline + one fold-window giveback
 /// Top-k less-than comparator width for the mod-add/sub overflow cleanup.
-pub const MSBS: usize = PAD; // 21
+pub const MSBS: usize = PAD; // comparator remains at baseline
 /// Chunk width for the measurement-vented chunked-gated register adder used on the
 /// peak-bound apply path. Sized so the per-call working set (one chunk's `W`
 /// carries + the `n/W` boundary carries + the erase comparator's `W` carries) fits
@@ -254,6 +254,10 @@ pub(crate) fn erase_carry_gated_opt(
     let s = a.len();
     let bit = circ.alloc_bit();
     circ.hmr(*carry, bit);
+    // HMR has reset the boundary carry to |0>. The phase-recovery comparator
+    // only needs the measurement bit plus the real incoming cin, so return the
+    // measured lane to the allocator before rebuilding the predicate.
+    circ.loan_zero_qubit(*carry);
     circ.push_condition(bit);
     let deposit = |c: &mut B, ta: &QubitId, tb: &QubitId, c_prev: &QubitId| match ctrl {
         Some(ct) => {
@@ -277,6 +281,44 @@ pub(crate) fn erase_carry_gated_opt(
         }
         _ => {
             super::comparator::compare_geq_cin_middle(circ, a, b, cin, deposit);
+        }
+    }
+    circ.pop_condition();
+}
+
+pub(crate) fn erase_carry_gated_zero_cin_opt(
+    circ: &mut B,
+    ctrl: Option<&QubitId>,
+    a: &[QubitId],
+    b: &[QubitId],
+    carry: &QubitId,
+    cap: Option<usize>,
+) {
+    let s = a.len();
+    let bit = circ.alloc_bit();
+    circ.hmr(*carry, bit);
+    circ.push_condition(bit);
+    let deposit = |c: &mut B, ta: &QubitId, tb: &QubitId, c_prev: &QubitId| match ctrl {
+        Some(ct) => {
+            c.z(*ct);
+            c.ccz(*ct, *ta, *tb);
+            c.cz(*ct, *c_prev);
+        }
+        None => {
+            c.neg();
+            c.cz(*ta, *tb);
+            c.z(*c_prev);
+        }
+    };
+    match cap {
+        Some(k) if k < s => {
+            let lo = s - k;
+            let zcin = circ.alloc_qubit();
+            super::comparator::compare_geq_cin_middle(circ, &a[lo..], &b[lo..], &zcin, deposit);
+            circ.zero_and_free(zcin);
+        }
+        _ => {
+            super::comparator::compare_geq_cin_middle(circ, a, b, carry, deposit);
         }
     }
     circ.pop_condition();
@@ -340,7 +382,6 @@ fn emit_chunked_capped(
         let carry = carries.pop().expect("carry present");
         let cin: &QubitId = if j == 0 { &cin0 } else { &carries[j - 1] };
         erase_carry_gated_opt(circ, ctrl, &y[lo..hi], &x[lo..hi], cin, &carry, cap);
-        circ.zero_and_free(carry);
     }
     circ.zero_and_free(cin0);
 }
@@ -644,6 +685,64 @@ fn const_chunk_add_clean(circ: &mut B, ctrl: &QubitId, a: &[QubitId], c: &[u8], 
     }
 }
 
+fn const_chunk_add_clean_drop_cout(circ: &mut B, ctrl: &QubitId, a: &[QubitId], c: &[u8], coff: usize, cin: &QubitId) {
+    let s = a.len();
+    if s == 0 {
+        return;
+    }
+    if s == 1 {
+        if cbit(c, coff) {
+            circ.cx(*ctrl, a[0]);
+        }
+        circ.cx(*cin, a[0]);
+        return;
+    }
+    let mut int: Vec<Option<QubitId>> = (0..s - 1).map(|_| Some(circ.alloc_qubit())).collect();
+    for i in 0..s - 1 {
+        let on = cbit(c, coff + i);
+        let cin_ref: QubitId = if i == 0 { *cin } else { *int[i - 1].as_ref().unwrap() };
+        let cout_ref: QubitId = *int[i].as_ref().unwrap();
+        circ.cx(cin_ref, a[i]);
+        if on {
+            circ.cx(*ctrl, cin_ref);
+        }
+        circ.ccx(a[i], cin_ref, cout_ref);
+        if on {
+            circ.cx(*ctrl, cin_ref);
+        }
+        circ.cx(cin_ref, cout_ref);
+    }
+    for i in 0..s - 1 {
+        if cbit(c, coff + i) {
+            circ.cx(*ctrl, a[i]);
+        }
+    }
+    if cbit(c, coff + s - 1) {
+        circ.cx(*ctrl, a[s - 1]);
+    }
+    circ.cx(*int[s - 2].as_ref().unwrap(), a[s - 1]);
+    for i in (0..s - 1).rev() {
+        let on = cbit(c, coff + i);
+        let int_i = int[i].take().unwrap();
+        let cin_ref: QubitId = if i == 0 { *cin } else { *int[i - 1].as_ref().unwrap() };
+        if on {
+            circ.cx(*ctrl, a[i]);
+        }
+        circ.cx(cin_ref, int_i);
+        if on {
+            circ.cx(*ctrl, cin_ref);
+        }
+        let b = circ.alloc_bit();
+        circ.hmr(int_i, b);
+        circ.zero_and_free(int_i);
+        circ.cz_if_bit(a[i], cin_ref, b);
+        if on {
+            circ.cx(*ctrl, cin_ref);
+            circ.cx(*ctrl, a[i]);
+        }
+    }
+}
+
 /// No-temp const carry comparator with a middle callback handing `(a_top, cy_top,
 /// const_top)`.
 fn compare_geq_const_cin_middle<F: FnOnce(&mut B, &QubitId, &QubitId, bool)>(circ: &mut B, a: &[QubitId], c: &[u8], coff: usize, cin: &QubitId, body: F) {
@@ -727,12 +826,17 @@ fn controlled_add_const_chunked_graduated_off(circ: &mut B, ctrl: &QubitId, a: &
     assert_eq!(lo, n, "graduated staircase (k={k}) covers {lo} < n={n}");
     let mut carries: Vec<QubitId> = Vec::with_capacity(bounds.len());
     for (j, &(clo, chi)) in bounds.iter().enumerate() {
+        if std::env::var("TLM_GRAD_FINAL_NO_COUT").ok().as_deref() == Some("1") && j + 1 == bounds.len() {
+            let cin_ref: QubitId = if j == 0 { *cin } else { carries[j - 1] };
+            const_chunk_add_clean_drop_cout(circ, ctrl, &a[clo..chi], c, coff + clo, &cin_ref);
+            break;
+        }
         let cout = circ.alloc_qubit();
         let cin_ref: QubitId = if j == 0 { *cin } else { carries[j - 1] };
         const_chunk_add_clean(circ, ctrl, &a[clo..chi], c, coff + clo, &cin_ref, &cout);
         carries.push(cout);
     }
-    for j in (0..bounds.len()).rev() {
+    for j in (0..carries.len()).rev() {
         let (clo, chi) = bounds[j];
         let carry = carries.pop().expect("carry present");
         let cin_ref: QubitId = if j == 0 { *cin } else { carries[j - 1] };
@@ -854,16 +958,25 @@ fn add_f_window(circ: &mut B, ctrl: &QubitId, reg: &[QubitId], lsbs: usize, c: &
         {
             reserve = 8;
         }
+        if let Some(call_reserve) =
+            env_index_value("TLM_TARGET_FFG_CALL_RESERVE_OVERRIDES", call_index)
+        {
+            reserve = call_reserve;
+        }
         headroom.saturating_sub(reserve)
     });
     let scheduled_g = g_sched
         .map_or_else(|| CEILING.saturating_sub(circ.active_qubits as usize), |g| g)
         .min(target_g.unwrap_or(usize::MAX))
         .min(n - 1);
+    let capped_g = std::env::var("TLM_FFG_MAX_G")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(scheduled_g, |cap| scheduled_g.min(cap));
     let g = std::env::var("TLM_FFG_FORCE_G")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .map_or(scheduled_g, |forced| forced.min(n - 1));
+        .map_or(capped_g, |forced| forced.min(n - 1));
     let trace_entry_active = circ.active_qubits;
     if g >= n - 1 {
         add_f_window_clean(circ, ctrl, reg, lsbs, c); // all-clean path

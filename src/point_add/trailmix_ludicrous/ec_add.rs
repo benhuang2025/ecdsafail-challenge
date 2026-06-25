@@ -40,6 +40,7 @@ use super::arith::{
 use super::gcd::{mod_mul_inverse_in_place, Direction};
 use super::square::mod_square_sub_pm_secp256k1_symmetric;
 use super::{B, BExt};
+use crate::point_add::{arith::mod_const_minus_reg_qb, SECP256K1_P};
 use crate::circuit::{BitId, QubitId};
 
 const N: usize = 256;
@@ -315,6 +316,14 @@ fn classical_add_into(circ: &mut B, acc: &[BitId], addend: &[BitId]) {
 fn coord_rsub(circ: &mut B, x: &[QubitId], coord: &[BitId]) {
     debug_assert_eq!(x.len(), N);
     debug_assert_eq!(coord.len(), N);
+    if std::env::var("TLM_FUSE_X_RESTORE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        mod_const_minus_reg_qb(circ, x, coord, SECP256K1_P);
+        return;
+    }
     let t: Vec<QubitId> = (0..N).map(|_| circ.alloc_qubit()).collect();
     for i in 0..N {
         circ.x_if_bit(t[i], coord[i]); // load: t := coord (per-shot classical)
